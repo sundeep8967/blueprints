@@ -1,0 +1,265 @@
+id: disk-saturation-self-healing-cleanup
+namespace: company.team
+
+description: |
+  Detect mount points above a configurable disk-usage threshold, free space by removing
+  logs older than a configurable age and stale temp files, re-check disk usage after
+  cleanup, and notify Slack with megabytes freed and the current usage percentage.
+
+inputs:
+  - id: usage_threshold_percent
+    type: INT
+    displayName: Usage Threshold (%)
+    description: Alert and remediate when any mount point reaches or exceeds this usage percentage.
+    defaults: 90
+    min: 50
+    max: 99
+
+  - id: log_dir
+    type: STRING
+    displayName: Log Directory to Clean
+    description: Absolute path to the log directory from which files older than log_max_age_days are removed.
+    defaults: "/var/log"
+
+  - id: log_max_age_days
+    type: INT
+    displayName: Maximum Log Age (days)
+    description: Delete log files last modified more than this many days ago.
+    defaults: 7
+    min: 1
+    max: 90
+
+  - id: tmp_dirs
+    type: STRING
+    displayName: Temp Directories to Clean (comma-separated)
+    description: Additional directories from which files older than log_max_age_days days are deleted.
+    defaults: "/tmp,/var/tmp"
+
+  - id: dry_run
+    type: BOOL
+    displayName: Dry Run
+    description: When true, reports what would be deleted without removing any files.
+    defaults: true
+
+variables:
+  slack_webhook: "{{ secret('SLACK_WEBHOOK_URL') }}"
+
+tasks:
+  - id: detect_disk_saturation
+    type: io.kestra.plugin.scripts.shell.Commands
+    description: Report disk usage for all mount points and flag those above the threshold.
+    commands:
+      - |
+        set -e
+        THRESHOLD={{ inputs.usage_threshold_percent }}
+
+        # Capture usage for all real mount points (exclude tmpfs, devtmpfs, etc.)
+        SATURATED=""
+        df -lPx tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null \
+          | tail -n +2 \
+          | while read FS SIZE USED AVAIL PCT MOUNT; do
+              USAGE=$(echo "${PCT}" | tr -d '%')
+              if [ "${USAGE}" -ge "${THRESHOLD}" ]; then
+                echo "SATURATED:${MOUNT}:${PCT}:${USED}KB:${AVAIL}KB"
+              fi
+            done > /tmp/saturated.txt
+
+        SATURATED_COUNT=$(grep -c '^SATURATED' /tmp/saturated.txt 2>/dev/null || echo "0")
+        cat /tmp/saturated.txt || true
+        echo "::{ \"outputs\": { \"saturated_count\": ${SATURATED_COUNT} } }::"
+        echo "Mount points above ${THRESHOLD}%: ${SATURATED_COUNT}."
+    outputFiles:
+      - "/tmp/saturated.txt"
+
+  - id: check_action_needed
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.detect_disk_saturation.vars.saturated_count | int > 0 }}"
+    then:
+      - id: cleanup_or_report
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.dry_run == false }}"
+        then:
+          - id: measure_before_cleanup
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Record total kilobytes used before cleanup to compute bytes freed.
+            commands:
+              - |
+                BEFORE=$(du -sk "{{ inputs.log_dir }}" 2>/dev/null | awk '{print $1}')
+                for D in $(echo "{{ inputs.tmp_dirs }}" | tr ',' ' '); do
+                  BEFORE=$((BEFORE + $(du -sk "${D}" 2>/dev/null | awk '{print $1}')))
+                done
+                echo "::{ \"outputs\": { \"kb_before\": ${BEFORE} } }::"
+                echo "Total KB in cleanup targets before: ${BEFORE}."
+
+          - id: clean_old_logs
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Delete log files older than log_max_age_days from log_dir.
+            commands:
+              - |
+                set -e
+                find "{{ inputs.log_dir }}" \
+                  -type f \
+                  -mtime +{{ inputs.log_max_age_days }} \
+                  -delete 2>/dev/null || true
+                echo "Old log files removed from {{ inputs.log_dir }}."
+
+          - id: clean_tmp_dirs
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Delete stale temp files older than log_max_age_days from tmp_dirs.
+            commands:
+              - |
+                set -e
+                for D in $(echo "{{ inputs.tmp_dirs }}" | tr ',' ' '); do
+                  find "${D}" \
+                    -mindepth 1 \
+                    -maxdepth 2 \
+                    -type f \
+                    -mtime +{{ inputs.log_max_age_days }} \
+                    -delete 2>/dev/null || true
+                done
+                echo "Stale temp files removed from {{ inputs.tmp_dirs }}."
+
+          - id: measure_after_cleanup
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Recalculate kilobytes used after cleanup and derive megabytes freed.
+            commands:
+              - |
+                AFTER=$(du -sk "{{ inputs.log_dir }}" 2>/dev/null | awk '{print $1}')
+                for D in $(echo "{{ inputs.tmp_dirs }}" | tr ',' ' '); do
+                  AFTER=$((AFTER + $(du -sk "${D}" 2>/dev/null | awk '{print $1}')))
+                done
+                BEFORE={{ outputs.measure_before_cleanup.vars.kb_before }}
+                FREED_KB=$((BEFORE - AFTER))
+                FREED_MB=$((FREED_KB / 1024))
+                echo "::{ \"outputs\": { \"freed_mb\": ${FREED_MB}, \"kb_after\": ${AFTER} } }::"
+                echo "Freed ${FREED_MB} MB (${FREED_KB} KB)."
+
+          - id: verify_disk_after_cleanup
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Re-check all mount points to see if any remain above the threshold.
+            commands:
+              - |
+                THRESHOLD={{ inputs.usage_threshold_percent }}
+                STILL=$(df -lPx tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null \
+                  | tail -n +2 \
+                  | awk -v T="${THRESHOLD}" '{
+                      gsub(/%/, "", $5);
+                      if ($5+0 >= T+0) count++
+                    } END { print count+0 }')
+                SUMMARY=$(df -lhx tmpfs -x devtmpfs 2>/dev/null | tail -n +2 | head -5 | tr '\n' '|')
+                echo "::{ \"outputs\": { \"still_saturated\": ${STILL}, \"df_summary\": \"${SUMMARY}\" } }::"
+                echo "Mount points still above ${THRESHOLD}% after cleanup: ${STILL}."
+
+          - id: notify_cleanup_result
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.verify_disk_after_cleanup.vars.still_saturated | int == 0 }}"
+            then:
+              - id: notify_success
+                type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+                url: "{{ vars.slack_webhook }}"
+                payload: |
+                  {"text": "✅ *Disk self-healing succeeded* — freed `{{ outputs.measure_after_cleanup.vars.freed_mb }} MB` of disk space. No mount points remain above {{ inputs.usage_threshold_percent }}%. Current usage: `{{ outputs.verify_disk_after_cleanup.vars.df_summary }}`."}
+            else:
+              - id: notify_escalation
+                type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+                url: "{{ vars.slack_webhook }}"
+                payload: |
+                  {"text": "🔴 *Disk escalation required* — freed `{{ outputs.measure_after_cleanup.vars.freed_mb }} MB` but `{{ outputs.verify_disk_after_cleanup.vars.still_saturated }}` mount point(s) remain above {{ inputs.usage_threshold_percent }}% after cleanup. Manual disk expansion or archival needed. Current: `{{ outputs.verify_disk_after_cleanup.vars.df_summary }}`."}
+        else:
+          - id: notify_dry_run
+            type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+            url: "{{ vars.slack_webhook }}"
+            payload: |
+              {"text": "⚠️ *Disk saturation detected (dry run)* — `{{ outputs.detect_disk_saturation.vars.saturated_count }}` mount point(s) above {{ inputs.usage_threshold_percent }}%. Set `dry_run=false` to trigger cleanup."}
+    else:
+      - id: notify_healthy
+        type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+        url: "{{ vars.slack_webhook }}"
+        payload: |
+          {"text": "✅ *Disk health OK* — all mount points are below {{ inputs.usage_threshold_percent }}% usage."}
+
+errors:
+  - id: alert_flow_failure
+    type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+    url: "{{ vars.slack_webhook }}"
+    payload: |
+      {"text": "🔴 *Disk saturation self-healing flow failed* — execution `{{ execution.id }}` encountered an unexpected error. Check Kestra logs."}
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    disabled: true
+
+extend:
+  title: "Disk Saturation Self-Healing Cleanup"
+  description: |
+    Detects mount points above a configurable usage threshold, frees space by removing
+    stale log and temp files, re-checks disk usage after cleanup, and notifies Slack
+    with megabytes freed and current usage, or escalates if saturation persists.
+
+    ## How it works
+
+    1. `detect_disk_saturation` runs `df -lP` (excluding virtual filesystems) and flags
+       every mount point at or above `usage_threshold_percent`.
+    2. `check_action_needed` branches on the saturated count.
+       - **Count > 0** and `dry_run=false`: `measure_before_cleanup` records the total
+         kilobytes used across the configured log and temp directories. `clean_old_logs`
+         removes files in `log_dir` older than `log_max_age_days` days.
+         `clean_tmp_dirs` does the same for each directory in `tmp_dirs`. After both
+         cleanup tasks complete, `measure_after_cleanup` recomputes usage and derives
+         megabytes freed. `verify_disk_after_cleanup` runs `df` again to count mount
+         points still over the threshold.
+       - **Count > 0** and `dry_run=true`: `notify_dry_run` posts a Slack alert without
+         deleting anything.
+       - **Count == 0**: `notify_healthy` posts a clean-pass message.
+    3. `notify_cleanup_result` posts a success or escalation Slack message based on
+       whether any mount point remains saturated.
+    4. The `errors` block catches unexpected flow failures with a dedicated Slack alert.
+    5. `schedule` runs hourly; ship it disabled and enable once verified.
+
+    ## What you get
+
+    - Automatic reclamation of disk space before services begin rejecting writes or
+      crashing due to a full filesystem, reducing MTTR for disk saturation incidents.
+    - A dry-run mode for reviewing what would be removed before enabling automated
+      deletion on a production host.
+    - Megabytes-freed and current `df` output surfaced directly in the Slack notification,
+      giving the on-call engineer actionable context without logging into the host.
+
+    ## Prerequisites
+
+    - `df`, `du`, and `find` must be available on the Kestra worker (standard on any
+      Linux host).
+    - The worker process must have write permission to `log_dir` and each path in
+      `tmp_dirs`.
+    - A Slack incoming webhook stored as `SLACK_WEBHOOK_URL`.
+
+    ## Secrets required
+
+    - `SLACK_WEBHOOK_URL`: Slack incoming webhook URL.
+
+    ## Troubleshooting
+
+    - If `find -delete` removes fewer files than expected, confirm the worker's user has
+      write access to the target directories and that no files are open by other processes
+      with `lsof +D /var/log`.
+    - If saturation persists after cleanup, the dominant consumer is not in `log_dir` or
+      `tmp_dirs`; run `du -sh /* | sort -rh | head` on the host to identify the culprit.
+    - In Kestra OSS, supply secrets as environment variables prefixed `SECRET_` and
+      base64-encoded.
+
+    ## References
+
+    - [Linux df command](https://man7.org/linux/man-pages/man1/df.1.html)
+    - [Linux find command](https://man7.org/linux/man-pages/man1/find.1.html)
+    - [Kestra Shell Commands plugin](https://kestra.io/plugins/plugin-script-shell)
+
+  tags:
+    - Infrastructure
+    - Linux
+  subTags:
+    - Self-Healing
+    - Monitoring & Alerting
+  ee: false
+  demo: false
