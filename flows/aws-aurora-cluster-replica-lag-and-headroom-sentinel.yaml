@@ -1,0 +1,260 @@
+id: aws-aurora-cluster-replica-lag-and-headroom-sentinel
+namespace: company.database
+description: |
+  Monitors Amazon Aurora MySQL and PostgreSQL DB clusters across an AWS region for reader replica lag,
+  abnormal cluster node status, and read staleness risk, alerting database administrators on Slack.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: aws_region
+    type: STRING
+    displayName: AWS Region
+    description: AWS Region where Amazon Aurora clusters are deployed.
+    defaults: us-east-1
+
+  - id: warning_replica_lag_milliseconds
+    type: FLOAT
+    displayName: Warning Replica Lag Threshold (ms)
+    description: Maximum acceptable reader replica lag in milliseconds before triggering a warning alert.
+    defaults: 100.0
+
+triggers:
+  - id: periodic_aurora_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic health and replica lag audit of Aurora clusters every 15 minutes.
+    cron: "*/15 * * * *"
+    disabled: true
+
+tasks:
+  - id: audit_aurora_cluster_health
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: Query regional Amazon Aurora clusters and inspect CloudWatch AuroraReplicaLag metrics for read staleness.
+    region: "{{ inputs.aws_region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    commands:
+      - |
+        aws rds describe-db-clusters --output json > aurora_clusters.json
+
+        python3 -c "
+        import json, subprocess, sys
+
+        with open('aurora_clusters.json') as f:
+            cluster_data = json.load(f)
+
+        clusters = cluster_data.get('DBClusters', [])
+        lag_threshold = float('{{ inputs.warning_replica_lag_milliseconds }}')
+
+        degraded_clusters = []
+        audited_count = 0
+
+        start_cmd = 'date -u -v-15M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d \"15 minutes ago\" +%Y-%m-%dT%H:%M:%SZ'
+        end_cmd = 'date -u +%Y-%m-%dT%H:%M:%SZ'
+
+        start_time = subprocess.check_output(start_cmd, shell=True, text=True).strip()
+        end_time = subprocess.check_output(end_cmd, shell=True, text=True).strip()
+
+        for cluster in clusters:
+            engine = cluster.get('Engine', '')
+            if 'aurora' not in engine.lower():
+                continue
+
+            cluster_id = cluster.get('DBClusterIdentifier', 'unknown')
+            status = cluster.get('Status', 'unknown')
+            members = cluster.get('DBClusterMembers', [])
+            reader_ids = [m.get('DBInstanceIdentifier') for m in members if not m.get('IsClusterWriter', False)]
+            audited_count += 1
+
+            reader_lags = {}
+            for reader_id in reader_ids:
+                cw_cmd = (
+                    f'aws cloudwatch get-metric-data '
+                    f'--metric-data-queries \"[{{\\\"Id\\\":\\\"lag\\\",\\\"MetricStat\\\":{{\\\"Metric\\\":{{\\\"Namespace\\\":\\\"AWS/RDS\\\",\\\"MetricName\\\":\\\"AuroraReplicaLag\\\",\\\"Dimensions\\\":[{{\\\"Name\\\":\\\"DBInstanceIdentifier\\\",\\\"Value\\\":\\\"{reader_id}\\\"}}]}},\\\"Period\\\":300,\\\"Stat\\\":\\\"Maximum\\\"}},\\\"ReturnData\\\":true}}]\" '
+                    f'--start-time \"{start_time}\" --end-time \"{end_time}\" --output json'
+                )
+                cw_res = subprocess.run(cw_cmd, shell=True, capture_output=True, text=True)
+                if cw_res.returncode == 0:
+                    cw_data = json.loads(cw_res.stdout)
+                    values = cw_data.get('MetricDataResults', [{}])[0].get('Values', [])
+                    max_lag = max(values) if values else 0.0
+                    reader_lags[reader_id] = round(max_lag, 2)
+
+            lagging_readers = {rid: lag for rid, lag in reader_lags.items() if lag >= lag_threshold}
+
+            if lagging_readers or status not in ['available', 'backing-up']:
+                is_crit = any(lag >= lag_threshold * 2 for lag in lagging_readers.values()) or status not in ['available', 'backing-up']
+                severity = 'CRITICAL' if is_crit else 'WARNING'
+                degraded_clusters.append({
+                    'cluster_id': cluster_id,
+                    'engine': engine,
+                    'status': status,
+                    'reader_count': len(reader_ids),
+                    'reader_lags_ms': reader_lags,
+                    'lagging_readers': lagging_readers,
+                    'severity': severity
+                })
+
+        summary_lines = []
+        for dc in degraded_clusters:
+            lag_str = ', '.join([f\"{rid}: {lag}ms\" for rid, lag in dc['lagging_readers'].items()]) if dc['lagging_readers'] else 'Normal lag'
+            summary_lines.append(
+                f\"[{dc['severity']}] {dc['cluster_id']} ({dc['engine']} - status: {dc['status']}): Lagging readers: {lag_str}\"
+            )
+
+        result = {
+            'region': '{{ inputs.aws_region }}',
+            'total_clusters': len(clusters),
+            'audited_clusters': audited_count,
+            'degraded_count': len(degraded_clusters),
+            'degraded_clusters': degraded_clusters,
+            'alert_triggered': len(degraded_clusters) > 0,
+            'summary_report': '\n'.join(summary_lines) if summary_lines else 'All audited Aurora clusters are healthy.'
+        }
+
+        with open('aurora_summary.json', 'w') as out:
+            json.dump(result, out, indent=2)
+
+        print('Aurora Cluster audit completed:', json.dumps(result, indent=2))
+        "
+    outputFiles:
+      - aurora_summary.json
+
+  - id: evaluate_aurora_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate Aurora cluster health audit and trigger Slack alert if degraded clusters are detected.
+    condition: "{{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).alert_triggered }}"
+    then:
+      - id: alert_dba_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch high-priority alert to DBA Slack with lagging Aurora reader breakdown.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "danger",
+                "title": "Amazon Aurora Cluster Replica Lag Alert",
+                "text": "Detected *{{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).degraded_count }}* Aurora cluster(s) in region `{{ inputs.aws_region }}` with reader replica lag exceeding threshold or abnormal node state.\n\n*Summary Report:*\n```\n{{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).summary_report }}\n```",
+                "footer": "Kestra Cloud Sentinel • Amazon Aurora"
+              }
+            ]
+          }
+
+  - id: export_audit_telemetry
+    type: io.kestra.plugin.core.log.Log
+    description: Record Aurora cluster health telemetry and summary report in Kestra execution logs.
+    message: |
+      Audit complete for AWS Region {{ inputs.aws_region }}.
+      Total database clusters: {{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).total_clusters }}
+      Audited Aurora clusters: {{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).audited_clusters }}
+      Degraded clusters: {{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).degraded_count }}
+      Alert triggered: {{ fromJson(read(outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'])).alert_triggered }}
+
+errors:
+  - id: notify_sentinel_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Send alert if AWS CLI API introspection fails during execution.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": "Amazon Aurora Sentinel Execution Failure",
+            "text": "Failed to audit Aurora cluster health in region `{{ inputs.aws_region }}`. Check AWS IAM permissions or API connectivity.",
+            "footer": "Kestra Cloud Sentinel • Error Handler"
+          }
+        ]
+      }
+
+extend:
+  metaDescription: "Audit Amazon Aurora clusters for reader replica lag, abnormal cluster node state, and read staleness, then dispatch alerts to Slack."
+  metaTitle: Amazon Aurora DB Cluster Reader Replica Lag Sentinel with Kestra
+  title: Amazon Aurora DB Cluster Reader Replica Lag Sentinel
+  shortDescription: Audit Amazon Aurora clusters for reader replica lag, abnormal cluster node state, and read staleness, then dispatch alerts to Slack.
+  description: |
+    ## How it works
+
+    This sentinel connects to Amazon Relational Database Service (RDS) to audit all Amazon Aurora (MySQL and PostgreSQL compatible) clusters across an AWS region. It performs a multi-node health and replication evaluation:
+
+    1. **Regional Cluster Discovery**: Calls `aws rds describe-db-clusters` to enumerate database clusters, filtering specifically for Aurora storage architecture engines.
+    2. **Cluster Topology Mapping**: For each cluster, it maps writer and reader node instances from `DBClusterMembers`.
+    3. **CloudWatch Telemetry Introspection**: For every active reader instance in the cluster, it queries CloudWatch for `AuroraReplicaLag` over the past 15 minutes, measuring the synchronization delay between the shared distributed storage volume and the reader cache.
+    4. **Read Staleness Detection**: Flags a `WARNING` if any reader replica lag exceeds `warning_replica_lag_milliseconds` (default 100ms), and escalates to `CRITICAL` if lag doubles or if cluster nodes report unhealthy states (`failing-over`, `inaccessible-encryption-credentials`, `migration-failed`).
+    5. **Automated Notification**: Generates a consolidated summary report and dispatches a structured alert to Slack via incoming webhook.
+
+    ## What you get
+
+    - **Read Staleness Prevention**: Catches lagging Aurora reader instances before analytical queries or read-heavy APIs serve stale data to users.
+    - **Fleet-Wide Regional Visibility**: Automatically discovers all Aurora clusters in the AWS region without requiring hardcoded cluster identifier lists.
+    - **Early Warning Before Failover Degradation**: Detects reader node synchronization lag before automatic failover promotes a lagged node or causes reader restart loops.
+    - **Zero Engine Disruption**: Read-only API and CloudWatch metric inspection without locks, table scans, or performance penalties.
+
+    ## Who it's for
+
+    - **Database Administrators (DBAs)**: Managing high-throughput Amazon Aurora PostgreSQL and MySQL clusters.
+    - **Backend & Data Engineers**: Relying on reader endpoints for real-time reporting, CDC event streams, and transactional microservices.
+    - **Site Reliability Engineers (SREs)**: Monitoring database reliability and replication SLAs across multi-tier applications.
+
+    ## Why orchestrate this with Kestra
+
+    AWS CloudWatch alarms monitor single instances in isolation, but they do not automatically map dynamic Aurora cluster topologies, isolate reader instances from writers, and correlate cross-cluster replication health across a regional fleet. Kestra combines AWS CLI introspection, CloudWatch metric evaluation, conditional branching, and Slack notification into an automated, declarative workflow.
+
+    ## Inputs
+
+    | Name | Type | Default | Description |
+    | :--- | :--- | :--- | :--- |
+    | `aws_region` | STRING | `us-east-1` | AWS Region where Amazon Aurora clusters are deployed. |
+    | `warning_replica_lag_milliseconds` | FLOAT | `100.0` | Maximum acceptable reader replica lag in milliseconds before triggering a warning alert. |
+
+    ## Expected outputs
+
+    - `{{ outputs.audit_aurora_cluster_health.outputFiles['aurora_summary.json'] }}`: Complete JSON report with regional cluster counts, audited groups, degraded clusters, and per-reader lag metrics.
+    - `{{ outputs.export_audit_telemetry }}`: Execution log summary detailing regional cluster statistics and alert triggers.
+
+    ## Prerequisites
+
+    - An AWS account with permissions to execute `rds:DescribeDBClusters` and `cloudwatch:GetMetricData`.
+    - Provisioned Amazon Aurora MySQL or PostgreSQL clusters.
+    - A Slack Incoming Webhook URL configured for your database alerting channel.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: AWS IAM access key ID with read access to RDS and CloudWatch.
+    - `AWS_SECRET_ACCESS_KEY`: AWS IAM secret access key corresponding to the access key ID.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL used for sending database alerts.
+
+    ## Quick start
+
+    1. Configure `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this flow YAML into your Kestra instance.
+    3. Click **Execute** in the UI with your target `aws_region`.
+    4. Review execution outputs to inspect Aurora cluster replication health.
+
+    ## Common pitfalls and troubleshooting
+
+    - **Aurora vs Standard RDS Storage Model**: Aurora uses a distributed, log-structured shared storage volume where readers read from the same 6-way replicated storage without separate physical disks. `AuroraReplicaLag` measures the delay in applying log records to the reader in-memory buffer pool, not physical disk replication.
+    - **Clusters With No Readers**: Single-instance clusters without read replicas are audited and skipped safely from replica lag calculations.
+    - **Global Database Secondary Clusters**: In Aurora Global Databases, secondary clusters track replication via `AuroraGlobalDBReplicationLag`. This sentinel focuses on in-region reader nodes, but can be extended with global database metrics.
+
+    ## How to extend
+
+    - Add automated PagerDuty incident creation when replica lag exceeds 1000ms.
+    - Automatically scale up Aurora Auto Scaling reader capacity via `aws application-autoscaling` when read traffic causes persistent buffer cache invalidation lag.
+
+    ## Links
+
+    - Kestra AWS Plugin Documentation: https://kestra.io/plugins/plugin-aws
+    - Kestra Slack Plugin Documentation: https://kestra.io/plugins/plugin-notifications
+    - Amazon Aurora Monitoring Documentation: https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Monitoring.Metrics.html
+  tags:
+    - Cloud
+    - Infrastructure
+    - Data
+  subTags:
+    - Databases
+    - Monitoring & Alerting
+  ee: false
+  demo: false
