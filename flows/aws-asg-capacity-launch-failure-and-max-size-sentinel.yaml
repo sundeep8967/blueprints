@@ -1,0 +1,262 @@
+id: aws-asg-capacity-launch-failure-and-max-size-sentinel
+namespace: company.devops
+description: |
+  Monitors AWS Auto Scaling Groups across a region for failed scaling activities,
+  EC2 capacity shortages, and MaxSize ceiling saturation, alerting infrastructure teams on Slack.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: aws_region
+    type: STRING
+    displayName: AWS Region
+    description: AWS Region where Auto Scaling Groups are deployed.
+    defaults: us-east-1
+
+  - id: warning_headroom_percentage
+    type: FLOAT
+    displayName: Warning Headroom Threshold (%)
+    description: Minimum acceptable scaling headroom percentage remaining before triggering a warning alert.
+    defaults: 15.0
+
+  - id: alert_on_failed_activities
+    type: BOOLEAN
+    displayName: Alert on Failed Activities
+    description: Trigger an alert when recent scaling activities fail due to capacity shortages or configuration errors.
+    defaults: true
+
+triggers:
+  - id: periodic_asg_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Periodic health and capacity audit of Auto Scaling Groups every 30 minutes.
+    cron: "*/30 * * * *"
+    disabled: true
+
+tasks:
+  - id: audit_asg_capacity_and_activities
+    type: io.kestra.plugin.aws.cli.AwsCLI
+    description: Query regional Auto Scaling Groups and describe scaling activities to evaluate capacity starvation risk.
+    region: "{{ inputs.aws_region }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    commands:
+      - |
+        aws autoscaling describe-auto-scaling-groups --output json > asg_groups.json
+
+        python3 -c "
+        import json, subprocess, sys
+
+        with open('asg_groups.json') as f:
+            asg_data = json.load(f)
+
+        groups = asg_data.get('AutoScalingGroups', [])
+        headroom_threshold = float('{{ inputs.warning_headroom_percentage }}')
+        alert_on_failed = str('{{ inputs.alert_on_failed_activities }}').lower() == 'true'
+
+        degraded_asgs = []
+        audited_count = 0
+
+        for asg in groups:
+            asg_name = asg.get('AutoScalingGroupName', 'unknown')
+            min_size = asg.get('MinSize', 0)
+            max_size = asg.get('MaxSize', 0)
+            desired = asg.get('DesiredCapacity', 0)
+            instances = asg.get('Instances', [])
+            instance_count = len(instances)
+            audited_count += 1
+
+            headroom_count = max_size - desired if max_size > desired else 0
+            headroom_pct = round((headroom_count / max_size) * 100, 2) if max_size > 0 else 0.0
+
+            is_ceiling = (max_size > 0 and desired >= max_size)
+            is_low_headroom = (max_size > 0 and headroom_pct <= headroom_threshold)
+
+            failed_reasons = []
+            if alert_on_failed:
+                cmd = f'aws autoscaling describe-scaling-activities --auto-scaling-group-name \"{asg_name}\" --max-items 10 --output json'
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if res.returncode == 0:
+                    act_data = json.loads(res.stdout)
+                    for act in act_data.get('Activities', []):
+                        status = act.get('StatusCode', '')
+                        if status in ['Failed', 'Cancelled']:
+                            cause = act.get('Cause', 'Scaling activity failed')
+                            failed_reasons.append(cause[:180])
+
+            if is_ceiling or is_low_headroom or failed_reasons:
+                severity = 'CRITICAL' if (is_ceiling or failed_reasons) else 'WARNING'
+                degraded_asgs.append({
+                    'asg_name': asg_name,
+                    'min_size': min_size,
+                    'max_size': max_size,
+                    'desired_capacity': desired,
+                    'current_instances': instance_count,
+                    'headroom_count': headroom_count,
+                    'headroom_percentage': headroom_pct,
+                    'is_ceiling_reached': is_ceiling,
+                    'failed_activities': failed_reasons[:3],
+                    'severity': severity
+                })
+
+        summary_lines = []
+        for da in degraded_asgs:
+            ceiling_str = 'CEILING REACHED' if da['is_ceiling_reached'] else f\"{da['headroom_percentage']}% headroom\"
+            reason_str = f\" | Failures: {'; '.join(da['failed_activities'])}\" if da['failed_activities'] else ''
+            summary_lines.append(
+                f\"[{da['severity']}] {da['asg_name']}: {da['desired_capacity']}/{da['max_size']} instances ({ceiling_str}){reason_str}\"
+            )
+
+        result = {
+            'region': '{{ inputs.aws_region }}',
+            'total_asgs': len(groups),
+            'audited_asgs': audited_count,
+            'degraded_count': len(degraded_asgs),
+            'degraded_asgs': degraded_asgs,
+            'alert_triggered': len(degraded_asgs) > 0,
+            'summary_report': '\n'.join(summary_lines) if summary_lines else 'All audited Auto Scaling groups are healthy.'
+        }
+
+        with open('asg_summary.json', 'w') as out:
+            json.dump(result, out, indent=2)
+
+        print('ASG Capacity audit completed:', json.dumps(result, indent=2))
+        "
+    outputFiles:
+      - asg_summary.json
+
+  - id: evaluate_asg_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluate ASG capacity audit and trigger Slack notification if degraded groups are detected.
+    condition: "{{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).alert_triggered }}"
+    then:
+      - id: alert_devops_slack
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatch high-priority alert to DevOps Slack with degraded ASG breakdown.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "attachments": [
+              {
+                "color": "danger",
+                "title": "AWS Auto Scaling Group Capacity & Scaling Alert",
+                "text": "Detected *{{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).degraded_count }}* degraded Auto Scaling group(s) in region `{{ inputs.aws_region }}` hitting MaxSize ceiling or reporting failed activities.\n\n*Summary Report:*\n```\n{{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).summary_report }}\n```",
+                "footer": "Kestra Cloud Sentinel • AWS Auto Scaling"
+              }
+            ]
+          }
+
+  - id: export_audit_telemetry
+    type: io.kestra.plugin.core.log.Log
+    description: Record ASG capacity health telemetry and summary report in Kestra execution logs.
+    message: |
+      Audit complete for AWS Region {{ inputs.aws_region }}.
+      Total Auto Scaling groups: {{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).total_asgs }}
+      Audited groups: {{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).audited_asgs }}
+      Degraded groups: {{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).degraded_count }}
+      Alert triggered: {{ fromJson(read(outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'])).alert_triggered }}
+
+errors:
+  - id: notify_sentinel_error
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    description: Send alert if AWS CLI API introspection fails during execution.
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+      {
+        "attachments": [
+          {
+            "color": "danger",
+            "title": "AWS ASG Sentinel Execution Failure",
+            "text": "Failed to audit Auto Scaling group health in region `{{ inputs.aws_region }}`. Check AWS IAM permissions or API connectivity.",
+            "footer": "Kestra Cloud Sentinel • Error Handler"
+          }
+        ]
+      }
+
+extend:
+  metaDescription: "Audit AWS Auto Scaling groups for failed launch activities, spot capacity exhaustion, and MaxSize ceiling saturation, then dispatch alerts to Slack."
+  metaTitle: AWS Auto Scaling Group Capacity and Scaling Activity Sentinel with Kestra
+  title: AWS Auto Scaling Group Capacity and Scaling Activity Sentinel
+  shortDescription: Audit AWS Auto Scaling groups for failed launch activities, spot capacity exhaustion, and MaxSize ceiling saturation, then dispatch alerts to Slack.
+  description: |
+    ## How it works
+
+    This sentinel connects to AWS Auto Scaling to inspect all Auto Scaling Groups (ASGs) across an AWS region. It performs a multi-dimensional capacity and operational audit:
+
+    1. **Regional ASG Enumeration**: Calls `aws autoscaling describe-auto-scaling-groups` to retrieve current instance counts, desired capacity, minimum size, and maximum size limits across the entire fleet.
+    2. **Scaling Activity Introspection**: For each group, it calls `aws autoscaling describe-scaling-activities` to detect failed or cancelled launch attempts caused by EC2 capacity shortages (`InsufficientInstanceCapacity`), Spot market interruption, subnet IP exhaustion (`PrivateIpAddressLimitExceeded`), or invalid Launch Templates.
+    3. **Ceiling Saturation Evaluation**: Calculates remaining expansion headroom `(MaxSize - DesiredCapacity) / MaxSize * 100`. If desired capacity reaches or exceeds `MaxSize`, it flags an immediate `CRITICAL` alert because the group cannot scale out during traffic spikes. If remaining headroom drops below `warning_headroom_percentage`, it flags a `WARNING`.
+    4. **Automated Notification**: Compiles a structured report detailing group names, capacity ratios, headroom percentages, and root-cause failure descriptions, dispatching the alert to Slack via incoming webhook.
+
+    ## What you get
+
+    - **Capacity Starvation Detection**: Uncovers silent EC2 launch failures that standard CloudWatch alarms miss when Spot markets or on-demand pools run out of capacity.
+    - **MaxSize Ceiling Protection**: Identifies groups that have silently saturated their maximum scaling cap before burst traffic causes service degradation or latency spikes.
+    - **Fleet-Wide Visibility**: Automatically evaluates all Auto Scaling groups across the AWS region without requiring hardcoded group lists.
+    - **Rapid Root-Cause Analysis**: Surfaces exact failure cause strings directly in Slack for immediate remediation.
+
+    ## Who it's for
+
+    - **DevOps Engineers & SREs**: Managing container clusters (EKS, ECS) or EC2 fleets scaling dynamically under production loads.
+    - **Cloud Infrastructure Architects**: Guarding multi-tier cloud architectures against subnet exhaustion and instance type capacity limits.
+    - **Platform Engineers**: Ensuring self-healing infrastructure can reliably launch replacements when worker nodes terminate.
+
+    ## Why orchestrate this with Kestra
+
+    AWS CloudWatch can trigger alarms on high CPU or memory utilization, but it does not alert when Auto Scaling fails to fulfill a scale-out request due to cloud capacity exhaustion or configuration drift. Kestra combines AWS CLI introspection, scaling activity log evaluation, conditional branching, and Slack notification into an automated, auditable workflow.
+
+    ## Inputs
+
+    | Name | Type | Default | Description |
+    | :--- | :--- | :--- | :--- |
+    | `aws_region` | STRING | `us-east-1` | AWS Region where Auto Scaling Groups are deployed. |
+    | `warning_headroom_percentage` | FLOAT | `15.0` | Minimum acceptable scaling headroom percentage remaining before triggering a warning alert. |
+    | `alert_on_failed_activities` | BOOLEAN | `true` | Trigger an alert when recent scaling activities fail due to capacity shortages or configuration errors. |
+
+    ## Expected outputs
+
+    - `{{ outputs.audit_asg_capacity_and_activities.outputFiles['asg_summary.json'] }}`: Complete JSON report with regional ASG counts, audited groups, degraded groups, and failed activity cause strings.
+    - `{{ outputs.export_audit_telemetry }}`: Execution log summary detailing regional group statistics and alert triggers.
+
+    ## Prerequisites
+
+    - An AWS account with permissions to execute `autoscaling:DescribeAutoScalingGroups` and `autoscaling:DescribeScalingActivities`.
+    - Auto Scaling Groups deployed in the target region.
+    - A Slack Incoming Webhook URL configured for your infrastructure alerting channel.
+
+    ### Secrets
+
+    - `AWS_ACCESS_KEY_ID`: AWS IAM access key ID with read access to Auto Scaling.
+    - `AWS_SECRET_ACCESS_KEY`: AWS IAM secret access key corresponding to the access key ID.
+    - `SLACK_WEBHOOK_URL`: Slack Incoming Webhook endpoint URL used for sending capacity alerts.
+
+    ## Quick start
+
+    1. Configure `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Import this flow YAML into your Kestra instance.
+    3. Click **Execute** in the UI with your target `aws_region`.
+    4. Review execution outputs to inspect regional scaling capacity health.
+
+    ## Common pitfalls and troubleshooting
+
+    - **Suspended Scaling Processes**: If an ASG has its `Launch` or `Terminate` processes manually suspended, scaling activities will not be attempted. The sentinel audits attempted activities from the AWS API.
+    - **MaxSize Equals MinSize**: Fixed-size groups where `MaxSize == MinSize` are treated as fixed capacity. If desired capacity matches `MaxSize`, it is reported with 0% headroom. Adjust `warning_headroom_percentage` if fixed-capacity fleets are expected.
+    - **Spot Price Outbidding**: In Spot-only fleets, capacity may fluctuate rapidly. The sentinel inspects the last 10 activities to catch systemic launch rejections.
+
+    ## How to extend
+
+    - Add an automated remediation task that dynamically updates `MaxSize` via `aws autoscaling update-auto-scaling-group` after manager approval.
+    - Automatically fall back to on-demand instance types via Launch Template overrides when Spot capacity is exhausted.
+
+    ## Links
+
+    - Kestra AWS Plugin Documentation: https://kestra.io/plugins/plugin-aws
+    - Kestra Slack Plugin Documentation: https://kestra.io/plugins/plugin-notifications
+    - AWS Auto Scaling Activities Documentation: https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-verify-scaling-activity.html
+  tags:
+    - Cloud
+    - Infrastructure
+  subTags:
+    - Monitoring & Alerting
+  ee: false
+  demo: false
